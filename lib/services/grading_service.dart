@@ -1,93 +1,100 @@
+import 'dart:math';
+
 import '../models/detection.dart';
 import '../models/grading_result.dart';
 
-/// Applies the undersized heuristic and computes Grade A / URS percentages
-/// from a merged list of detections.
+/// Computes Grade A / URS percentages from a merged list of detections.
 ///
-/// **Undersized heuristic:** An onion is flagged as undersized if its
-/// bounding-box area is less than [undersizeRatio] × the mean area of all
-/// 'onion'-class detections in the same scan. This is a relative
-/// batch-comparison approach — no physical reference object needed.
+/// **Roles**
+/// - `onion` detections are the individual onions.
+/// - Every other label (`rotten`, `sprout`, `double_split`, `damaged`) is a
+///   defect.
 ///
-/// **Grade A:** Onions with zero overlapping defect boxes AND not undersized.
-/// **URS:** Everything else (defective or undersized).
+/// **Defect ↔ onion matching:** defects are usually small boxes *inside* a
+/// big onion box, so IoU is the wrong measure (a small patch on a large onion
+/// has a tiny IoU). We use `intersection / min(areaDefect, areaOnion)`
+/// instead: high when the defect lies inside the onion, and also high when a
+/// large defect box (e.g. a rotten onion) covers a whole onion.
+///
+/// **Undersized heuristic:** an `onion` box whose area is below
+/// [undersizeRatio] × the mean `onion` area of the scan (needs ≥ 2 onions).
+///
+/// **Grade A:** onion with no matched defect and not undersized.
+/// **URS:** everything else.
 class GradingService {
-  /// Ratio threshold for the undersized heuristic.
   /// An onion is undersized if `area < meanArea * undersizeRatio`.
-  ///
-  /// Default 0.5 = flag anything below 50 % of the batch average.
   static const double undersizeRatio = 0.5;
 
-  /// IoU threshold used to associate a defect box with an onion box.
-  /// If a defect overlaps an onion by more than this fraction, the onion
-  /// is considered defective.
-  static const double defectOverlapThreshold = 0.3;
+  /// Minimum overlap (see class doc) for a defect to be attached to an onion.
+  static const double defectOverlapThreshold = 0.5;
 
-  /// Processes raw detections into a full [GradingResult].
+  /// Labels that are NOT individual onions.
+  static const String _onionLabel = 'onion';
+
   GradingResult grade(List<Detection> detections) {
-    // ── 1. Separate Model 1 (veg model) detections from Model 2 (onion2) 'damaged' detections ──
-    final m1Detections = <Detection>[];
-    final m2DamagedDetections = <Detection>[];
+    final onions = <Detection>[];
+    final defects = <Detection>[];
 
     for (final d in detections) {
-      if (d.sourceModel == 'veg' || d.label != 'damaged') {
-        m1Detections.add(d);
+      if (d.label == _onionLabel) {
+        onions.add(d);
       } else {
-        m2DamagedDetections.add(d);
+        defects.add(d);
       }
     }
 
-    final defectiveM1Indices = <int>{};
+    final defectiveOnionIdx = <int>{};
 
-    // Mark Model 1 detections whose labels are defects ('rotten', 'sprout', 'double_split')
-    for (int i = 0; i < m1Detections.length; i++) {
-      final label = m1Detections[i].label;
-      if (label == 'rotten' || label == 'sprout' || label == 'double_split') {
-        defectiveM1Indices.add(i);
+    // ── 1. Attach each defect to the onion it overlaps most ──
+    final standaloneDefects = <Detection>[];
+
+    for (final defect in defects) {
+      int bestIdx = -1;
+      double bestOverlap = 0.0;
+
+      for (int i = 0; i < onions.length; i++) {
+        final o = _overlap(onions[i], defect);
+        if (o > bestOverlap) {
+          bestOverlap = o;
+          bestIdx = i;
+        }
+      }
+
+      if (bestIdx != -1 && bestOverlap >= defectOverlapThreshold) {
+        defectiveOnionIdx.add(bestIdx);
+      } else {
+        // Defect with no onion box (model missed the onion itself).
+        // Count it as one rejected onion — but only once if several
+        // defect boxes sit on the same spot.
+        final alreadyCounted = standaloneDefects
+            .any((s) => _overlap(s, defect) >= defectOverlapThreshold);
+        if (!alreadyCounted) standaloneDefects.add(defect);
       }
     }
 
-    // ── 2. Undersized heuristic ──
-    final undersizedIndices = <int>[];
+    // ── 2. Undersized heuristic (onion boxes only) ──
+    final undersizedIndices = <int>[]; // indices into `detections`
 
-    if (m1Detections.length >= 2) {
+    if (onions.length >= 2) {
       final meanArea =
-          m1Detections.fold<double>(0.0, (sum, d) => sum + d.area) /
-              m1Detections.length;
+          onions.fold<double>(0.0, (sum, d) => sum + d.area) / onions.length;
 
-      for (int i = 0; i < m1Detections.length; i++) {
-        if (m1Detections[i].area < meanArea * undersizeRatio) {
-          final allIndex = detections.indexOf(m1Detections[i]);
-          if (allIndex != -1) {
-            undersizedIndices.add(allIndex);
-          }
-          defectiveM1Indices.add(i);
+      for (int i = 0; i < onions.length; i++) {
+        if (onions[i].area < meanArea * undersizeRatio) {
+          final allIndex = detections.indexOf(onions[i]);
+          if (allIndex != -1) undersizedIndices.add(allIndex);
+          defectiveOnionIdx.add(i);
         }
       }
     }
 
-    // ── 3. Find which Model 1 onions overlap with Model 2 damaged boxes ──
-    int standaloneDamagedCount = 0;
-
-    for (final damaged in m2DamagedDetections) {
-      bool overlapped = false;
-      for (int i = 0; i < m1Detections.length; i++) {
-        if (_iou(m1Detections[i], damaged) > defectOverlapThreshold) {
-          defectiveM1Indices.add(i);
-          overlapped = true;
-          break;
-        }
-      }
-      if (!overlapped) {
-        standaloneDamagedCount++;
-      }
-    }
-
-    final totalOnions = m1Detections.length + standaloneDamagedCount;
-    final ursCount = defectiveM1Indices.length + standaloneDamagedCount;
+    // ── 3. Totals ──
+    final standaloneCount = standaloneDefects.length;
+    final totalOnions = onions.length + standaloneCount;
+    final ursCount = defectiveOnionIdx.length + standaloneCount;
     final gradeACount = totalOnions - ursCount;
 
-    // ── 5. Per-class counts for the report ──
+    // ── 4. Per-class counts for the results screen / report ──
     final classCounts = <String, int>{};
     for (final d in detections) {
       classCounts[d.label] = (classCounts[d.label] ?? 0) + 1;
@@ -104,18 +111,21 @@ class GradingService {
     );
   }
 
-  /// Computes Intersection-over-Union between two detections.
-  double _iou(Detection a, Detection b) {
-    final xStart = a.left > b.left ? a.left : b.left;
-    final yStart = a.top > b.top ? a.top : b.top;
-    final xEnd = a.right < b.right ? a.right : b.right;
-    final yEnd = a.bottom < b.bottom ? a.bottom : b.bottom;
+  /// `intersection area / area of the smaller box`.
+  double _overlap(Detection a, Detection b) {
+    final xStart = max(a.left, b.left);
+    final yStart = max(a.top, b.top);
+    final xEnd = min(a.right, b.right);
+    final yEnd = min(a.bottom, b.bottom);
 
     if (xEnd <= xStart || yEnd <= yStart) return 0.0;
 
     final intersection = (xEnd - xStart) * (yEnd - yStart);
-    final union = a.area + b.area - intersection;
+    // Use clamped-box areas so boxes poking past the image edge don't skew it.
+    final areaA = (a.right - a.left) * (a.bottom - a.top);
+    final areaB = (b.right - b.left) * (b.bottom - b.top);
+    final smaller = min(areaA, areaB);
 
-    return union <= 0 ? 0.0 : intersection / union;
+    return smaller <= 0 ? 0.0 : intersection / smaller;
   }
 }
